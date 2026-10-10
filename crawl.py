@@ -148,11 +148,31 @@ def is_strike(tag):
     return "line-through" in cls or "line-through" in style
 
 
+def find_price_pairs(root):
+    """All (price, old_price) pairs: a struck-through number followed by a number.
+
+    The page can contain several such pairs (e.g. instalment info), so callers
+    must pick the right one - see parse_product.
+    """
+    pairs = []
+    for st in root.find_all(is_strike):
+        m_old = PRICE_RE.fullmatch(en_digits(clean(st.get_text())))
+        if not m_old:
+            continue
+        for sib in st.find_next_siblings():
+            m_new = PRICE_RE.fullmatch(en_digits(clean(sib.get_text())))
+            if m_new:
+                pairs.append((int(m_new.group(1).replace(",", "")),
+                              int(m_old.group(1).replace(",", ""))))
+            break
+    return pairs
+
+
 def parse_prices(soup):
     """Return (price, old_price) from the buy box next to the cart button."""
     cart = soup.find(string=lambda s: s and CART_TEXT in s)
     if cart is None:
-        return None, None
+        return None, None, False
 
     # walk up from the cart button until the container holds a price
     node, found = cart.parent, None
@@ -165,7 +185,7 @@ def parse_prices(soup):
             found = node
             break
     if found is None:
-        return None, None
+        return None, None, False
 
     # climb up to 2 more levels if the strike-through / discount label sits higher
     box = found
@@ -175,6 +195,19 @@ def parse_prices(soup):
         if box.parent is None:
             break
         box = box.parent
+
+    # most precise case: a struck-through <p>/<span> followed by the current price,
+    # e.g. <p class="line-through">126,000,000</p><p>125,499,000</p><span>تومان</span>
+    for st in box.find_all(is_strike):
+        m_old = PRICE_RE.fullmatch(en_digits(clean(st.get_text())))
+        if not m_old:
+            continue
+        for sib in st.find_next_siblings():
+            m_new = PRICE_RE.fullmatch(en_digits(clean(sib.get_text())))
+            if m_new:
+                return (int(m_new.group(1).replace(",", "")),
+                        int(m_old.group(1).replace(",", "")), True)
+            break
 
     strike_texts = set()
     for st in box.find_all(is_strike):
@@ -197,7 +230,7 @@ def parse_prices(soup):
     # fallback if the strike-through markup was not detected
     if old_price is None and len(others) >= 2 and "تخفیف" in box.get_text():
         price, old_price = min(others[:2]), max(others[:2])
-    return price, old_price
+    return price, old_price, False
 
 
 def parse_specs(strings):
@@ -272,9 +305,46 @@ def parse_ld_rating(soup):
     return (0.0, 0) if found_product else None
 
 
+def parse_ld_offer(soup):
+    """Return (price, in_stock) from the Product JSON-LD 'offers', or None if absent.
+
+    The page's JSON-LD says priceCurrency "IRR", but its numbers (e.g. 125499000)
+    are on the same scale as the prices shown on the page, so they are used as-is
+    (no /10 conversion). Verify this on a few products against the site.
+    """
+    for tag in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(tag.string or tag.get_text())
+        except (ValueError, TypeError):
+            continue
+        for item in (data if isinstance(data, list) else [data]):
+            if not isinstance(item, dict) or item.get("@type") != "Product":
+                continue
+            offers = item.get("offers")
+            if not isinstance(offers, dict):
+                return None, False
+            inner = [o for o in offers.get("offers", []) if isinstance(o, dict)]
+            in_stock = any("InStock" in str(o.get("availability", "")) for o in inner) \
+                if inner else "InStock" in str(offers.get("availability", ""))
+            price = None
+            if inner and inner[0].get("price") is not None:
+                price = inner[0]["price"]
+            elif offers.get("lowPrice") is not None:
+                price = offers["lowPrice"]
+            elif offers.get("price") is not None:
+                price = offers["price"]
+            try:
+                price = int(float(price)) if price is not None else None
+            except (TypeError, ValueError):
+                price = None
+            return price, in_stock
+    return None
+
+
 def parse_product(url, html):
     soup = BeautifulSoup(html, "html.parser")
     ld_rating = parse_ld_rating(soup)  # must run before <script> tags are removed
+    ld_offer = parse_ld_offer(soup)
     for t in soup(["script", "style", "noscript"]):
         t.decompose()
     strings = [clean(s) for s in soup.stripped_strings if clean(s)]
@@ -302,8 +372,25 @@ def parse_product(url, html):
     unavailable = any(UNAVAILABLE_TEXT == s or s.startswith(UNAVAILABLE_TEXT) for s in top)
     has_cart = any(CART_TEXT in s for s in top)
     row["available"] = bool(has_cart and not unavailable)
+    if ld_offer is not None:
+        ld_price, ld_in_stock = ld_offer
+        row["available"] = bool(ld_in_stock and ld_price)
     if row["available"]:
-        row["price"], row["old_price"] = parse_prices(soup)
+        ld_price = ld_offer[0] if ld_offer is not None else None
+        if ld_price:
+            # JSON-LD gives the real current price. The struck-through "old price"
+            # is the one whose neighbouring current price equals it; other pairs on
+            # the page (instalments, other offers) are ignored.
+            row["price"] = ld_price
+            for p, o in find_price_pairs(soup):
+                if p == ld_price and o > p:
+                    row["old_price"] = o
+                    break
+        else:
+            box_price, box_old, paired = parse_prices(soup)
+            row["price"] = box_price
+            if paired and box_old and box_old > box_price:
+                row["old_price"] = box_old
 
     # rating + rating_count: primary source is the Product JSON-LD (aggregateRating)
     if ld_rating is not None:
